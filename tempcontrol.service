@@ -1,0 +1,10 @@
+[Unit]
+Description=Start temp control
+After=lm_sensors.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tempcontrol
+
+[Install]
+WantedBy=multi-user.target
