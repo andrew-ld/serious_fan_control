@@ -4,17 +4,25 @@ set -e
 
 gpu_temp_path="/sys/class/hwmon/hwmon1/temp2_input"
 cpu_temp_path="/sys/class/hwmon/hwmon3/temp7_input"
-pwm_control_path="/sys/class/hwmon/hwmon3/pwm1"
+pwm_paths=("/sys/class/hwmon/hwmon3/pwm1" "/sys/class/hwmon/hwmon3/pwm3")
+
 max_pwm=255
 min_pwm=50
 
 enable_manual_fan_control() {
-    echo "1" > "${pwm_control_path}_enable"
+    for pwm_path in "${pwm_paths[@]}"
+    do
+        echo 1 > ${pwm_path}_enable
+    done
 }
 
 set_fan_pwm() {
     local pwm=$1
-    echo "$pwm" > "$pwm_control_path"
+
+    for pwm_path in "${pwm_paths[@]}"
+    do
+        echo "$pwm" > "${pwm_path}"
+    done
 }
 
 get_gpu_temp() {
