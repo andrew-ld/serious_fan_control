@@ -1,0 +1,241 @@
+import collections
+import json
+import logging
+import os
+import random
+import time
+from typing import Deque
+
+import numpy as np
+
+
+class HardwareInterface:
+    def __init__(self, gpu_temp_path: str, cpu_temp_path: str, pwm_paths: list[str], min_pwm: int, max_pwm: int):
+        self.gpu_temp_path = gpu_temp_path
+        self.cpu_temp_path = cpu_temp_path
+        self.pwm_paths = pwm_paths
+        self.min_pwm = min_pwm
+        self.max_pwm = max_pwm
+        self.current_pwm = min_pwm
+
+    @staticmethod
+    def check_privileges():
+        if os.geteuid() != 0:
+            raise SystemError("This script must be run as root.")
+
+    @staticmethod
+    def _read_file(path: str) -> int:
+        with open(path, 'r') as f:
+            return int(f.read().strip())
+
+    @staticmethod
+    def _write_file(path: str, value: int):
+        with open(path, 'w') as f:
+            f.write(str(value))
+
+    def enable_manual_control(self):
+        logging.info("Enabling manual fan control")
+        for pwm_path in self.pwm_paths:
+            self._write_file(f"{pwm_path}_enable", 1)
+
+    def disable_manual_control(self):
+        logging.info("Restoring automatic fan control")
+        for pwm_path in self.pwm_paths:
+            self._write_file(f"{pwm_path}_enable", 0)
+
+    def set_fan_speed(self, pwm: int):
+        clamped_pwm = max(self.min_pwm, min(self.max_pwm, int(pwm)))
+        if self.current_pwm != clamped_pwm:
+            self.current_pwm = clamped_pwm
+            for pwm_path in self.pwm_paths:
+                self._write_file(pwm_path, clamped_pwm)
+
+    def get_temps(self) -> tuple[float, float]:
+        gpu_temp = self._read_file(self.gpu_temp_path) / 1000.0
+        cpu_temp = self._read_file(self.cpu_temp_path) / 1000.0
+        return gpu_temp, cpu_temp
+
+    def get_max_temp(self) -> float:
+        gpu_temp, cpu_temp = self.get_temps()
+        return max(gpu_temp, cpu_temp)
+
+
+class AdaptivePIDFanController:
+    def __init__(
+            self,
+            hardware: HardwareInterface,
+            model_path: str,
+            target_temp: float,
+            eval_window: int,
+            perturbation_scale: float,
+            error_weight: float,
+            power_weight: float,
+            overshoot_weight: float
+    ):
+        self.hw = hardware
+        self.model_path = model_path
+        self.target_temp = target_temp
+        self.eval_window = eval_window
+        self.perturbation_scale = perturbation_scale
+        self.error_weight = error_weight
+        self.power_weight = power_weight
+        self.overshoot_weight = overshoot_weight
+        self.kp, self.ki, self.kd = 0.0, 0.0, 0.0
+        self._integral_error: float = 0.0
+        self._previous_error: float = 0.0
+        self.history: Deque[tuple[float, float]] = collections.deque(maxlen=eval_window)
+        self.step_count = 0
+        self.last_cost = float('inf')
+        self.gain_being_tested = None
+        self.original_gains = None
+        self.feed_forward_scale = 10.0
+        self._load_gains()
+
+    def _load_gains(self):
+        if not os.path.exists(self.model_path):
+            logging.warning(f"No model file at {self.model_path}. Controller will start with zeroed gains and learn.")
+            self.kp, self.ki, self.kd = 5.0, 0.1, 2.0  # Start with reasonable defaults
+            self._save_gains()
+            return
+
+        with open(self.model_path, 'r') as f:
+            data = json.load(f)
+            self.kp = data['kp']
+            self.ki = data['ki']
+            self.kd = data['kd']
+            logging.info(f"Loaded learned PID gains from {self.model_path}")
+
+    def _save_gains(self):
+        data = {'kp': self.kp, 'ki': self.ki, 'kd': self.kd}
+        with open(self.model_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        logging.info(f"Saved new PID gains to {self.model_path}")
+
+    def _calculate_cost(self) -> float:
+        if not self.history:
+            return float('inf')
+
+        errors = np.array([h[0] for h in self.history])
+        pwms = np.array([h[1] for h in self.history])
+        squared_error = np.mean(errors ** 2)
+        power_usage = np.mean(pwms)
+        overshoot_penalty = np.mean([max(0, e) for e in errors])
+
+        cost = (
+                (squared_error * self.error_weight) +
+                (power_usage * self.power_weight) +
+                (overshoot_penalty * self.overshoot_weight)
+        )
+        return cost
+
+    def _control_tick(self):
+        current_temp = self.hw.get_max_temp()
+        error = current_temp - self.target_temp
+
+        self._integral_error += error
+        self._integral_error = max(-50.0, min(50.0, self._integral_error))
+
+        derivative = error - self._previous_error
+
+        feed_forward_pwm = self.hw.min_pwm
+        if current_temp > self.target_temp:
+            feed_forward_pwm += (current_temp - self.target_temp) * self.feed_forward_scale
+
+        pid_output = (self.kp * error) + (self.ki * self._integral_error) + (self.kd * derivative)
+        new_pwm = feed_forward_pwm + pid_output
+        self.hw.set_fan_speed(new_pwm)
+
+        self._previous_error = error
+        self.history.append((error, self.hw.current_pwm))
+        self.step_count += 1
+
+        logging.info(
+            f"Temp: {current_temp:.2f}°C, Target: {self.target_temp}°C, "
+            f"Error: {error:+.2f}, PWM: {self.hw.current_pwm}, "
+            f"Gains: Kp={self.kp:.2f}, Ki={self.ki:.2f}, Kd={self.kd:.2f}"
+        )
+
+    def _learning_step(self):
+        current_cost = self._calculate_cost()
+
+        if self.gain_being_tested:
+            logging.info(f"Test finished for {self.gain_being_tested}. Base cost: {self.last_cost:.4f}, New cost: {current_cost:.4f}")
+            if current_cost < self.last_cost:
+                logging.info(f"Performance improved. Keeping new gain for {self.gain_being_tested}.")
+                self.last_cost = current_cost
+                self._save_gains()
+            else:
+                logging.info("No improvement. Reverting gain.")
+                self.kp, self.ki, self.kd = self.original_gains
+
+            self.gain_being_tested = None
+            self.original_gains = None
+        else:
+            self.last_cost = current_cost
+            self.original_gains = (self.kp, self.ki, self.kd)
+
+            gain_to_test = random.choice(['kp', 'ki', 'kd'])
+            self.gain_being_tested = gain_to_test
+
+            current_value = getattr(self, gain_to_test)
+            change = (current_value or 1.0) * self.perturbation_scale * random.choice([-1, 1])
+            new_value = max(0, current_value + change)
+            setattr(self, gain_to_test, new_value)
+
+            logging.info(f"Starting new evaluation window. Testing {gain_to_test} = {new_value:.4f}")
+
+        self.history.clear()
+
+    def loop_control(self):
+        self.hw.check_privileges()
+        self.hw.enable_manual_control()
+        self.hw.set_fan_speed(self.hw.min_pwm)
+
+        logging.info(f"Starting Adaptive PID fan control. Target: {self.target_temp}°C")
+
+        try:
+            while True:
+                self._control_tick()
+                if self.step_count > 0 and self.step_count % self.eval_window == 0:
+                    self._learning_step()
+                time.sleep(1.0)
+        finally:
+            self._save_gains()
+            self.hw.disable_manual_control()
+            logging.info("Hardware control restored to automatic mode.")
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    with open("/etc/advanced_fan_control_config.json") as config_file:
+        config = json.load(config_file)
+
+    hardware = HardwareInterface(
+        gpu_temp_path=config["gpu_temp_path"],
+        cpu_temp_path=config["cpu_temp_path"],
+        pwm_paths=config["pwm_paths"],
+        min_pwm=config["min_pwm"],
+        max_pwm=config["max_pwm"]
+    )
+
+    controller = AdaptivePIDFanController(
+        hardware=hardware,
+        model_path=config["model_path"],
+        target_temp=config["target_temp"],
+        eval_window=config.get("eval_window", 100),
+        perturbation_scale=config.get("perturbation_scale", 0.1),
+        error_weight=config.get("error_weight", 1.5),
+        power_weight=config.get("power_weight", 0.1),
+        overshoot_weight=config.get("overshoot_weight", 3.0)
+    )
+
+    controller.loop_control()
+
+
+if __name__ == "__main__":
+    main()
